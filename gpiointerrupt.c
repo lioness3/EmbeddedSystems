@@ -34,302 +34,60 @@
  *  ======== gpiointerrupt.c ========
  */
 
-//   Joann Carter
+// Joann Carter
+
+/* For usleep() */
+#include <unistd.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
 
+
 /* Driver Header files */
 #include <ti/drivers/GPIO.h>
-#include <ti/drivers/I2C.h>
-#include <ti/drivers/UART.h>
-#include <ti/drivers/Timer.h>
+
 
 /* Driver configuration */
 #include "ti_drivers_config.h"
-#define BUFLEN 100
-char output[BUFLEN];
-// write formated output to sized buffer
-#define DISPLAY(x) UART_write(uart, &output, x);
-UART_Handle uart;
-int16_t temperature;
-int16_t setPoint = 30; // initial temperature set point is 30 C
-unsigned int heat;
-volatile unsigned char IncreaseFlag = 0;
-volatile unsigned char DecreaseFlag = 0;
+// added for 32 bit timer driver
+#include <ti/drivers/Timer.h>
 
-// I2C Global Variables
-static const struct
-    {
-        uint8_t address;
-        uint8_t resultReg;
-    char *id;
-    } sensors[3] = {
-        { 0x48, 0x0000, "11X" },
-        { 0x49, 0x0000, "116" },
-        { 0x41, 0x0001, "006" }
-    };
-uint8_t txBuffer[1];
-uint8_t rxBuffer[2];
-I2C_Transaction i2cTransaction;
-// Driver Handles - Global variables
-I2C_Handle i2c;
-// Make sure you call initUART() before calling this function.
-void initI2C(void){
-    int8_t i, found;
-    I2C_Params i2cParams;
-    DISPLAY(snprintf(output, BUFLEN, "Initializing I2C Driver - "))
-    // Init the driver
-    I2C_init();
-    // Configure the driver
-    I2C_Params_init(&i2cParams);
-    i2cParams.bitRate = I2C_400kHz;
-    // Open the driver
-    i2c = I2C_open(CONFIG_I2C_0, &i2cParams);
-        if (i2c == NULL){
-            DISPLAY(snprintf(output, 64, "Failed\n\r"))
-            while (1);
-        }
-    DISPLAY(snprintf(output, 32, "Passed\n\r"))
-    // Boards were shipped with different sensors.
-    // Welcome to the world of embedded systems.
-    // Try to determine which sensor we have.
-    // Scan through the possible sensor addresses
-    /* Common I2C transaction setup */
-    i2cTransaction.writeBuf = txBuffer;
-    i2cTransaction.writeCount = 1;
-    i2cTransaction.readBuf = rxBuffer;
-    i2cTransaction.readCount = 0;
-    found = false;
-    for (i=0; i<3; ++i)
-    {
-        i2cTransaction.slaveAddress = sensors[i].address;
-        txBuffer[0] = sensors[i].resultReg;
-        DISPLAY(snprintf(output, BUFLEN, "Is this %s? ", sensors[i].id))
+bool isButtonPressed; // boolenan for button press
+uint32_t   dotTime = 150000; // 150 milliseconds to represent a dot
+uint32_t   dashTime = 400000; // 400 millisecond to represent a dash
+uint32_t   delayTime_char = 300000; // 300 millisecond  for delay between characters in word
+uint32_t   delayTime_word = 1500000; // 1500 milliseconds for delay between words
 
-        if (I2C_transfer(i2c, &i2cTransaction)){
-            DISPLAY(snprintf(output, BUFLEN, "Found\n\r"))
-            found = true;
-            break;
-        }
-    DISPLAY(snprintf(output, BUFLEN, "No\n\r"))
-    }
-
-    if(found){
-        DISPLAY(snprintf(output, BUFLEN, "Detected TMP%s I2C address: %x\n\r",
-                         sensors[i].id, i2cTransaction.slaveAddress))
-    }else{
-        DISPLAY(snprintf(output, BUFLEN, "Temperature sensor not found,contact professor\n\r"))
-    }
+volatile unsigned char TimerFlag = 0; // callback raises, main lowers
+void timerCallback(Timer_Handle myHandle, int_fast16_t status)
+{
+    TimerFlag = 1;
 }
-
-int16_t readTemp(void){
-    int16_t temperature = 0;
-    i2cTransaction.readCount = 2;
-    if (I2C_transfer(i2c, &i2cTransaction))
-    {
-    /*
-    * Extract degrees C from the received data;
-    * see TMP sensor datasheet
-    */
-    temperature = (rxBuffer[0] << 8) | (rxBuffer[1]);
-    temperature *= 0.0078125;
-    /*
-    * If the MSB is set '1', then we have a 2's complement
-    * negative value which needs to be sign extended
-    */
-        if (rxBuffer[0] & 0x80){
-        temperature |= 0xF000;
-        }
-
-    }else{
-        DISPLAY(snprintf(output, BUFLEN, "Error reading temperature sensor(%d)\n\r",
-                         i2cTransaction.status));
-        DISPLAY(snprintf(output, BUFLEN, "Please power cycle your board by unplugging USB and plugging back in.\n\r"));
-    }
-    return temperature;
-}
-
-
-// UART Global Variables
-
-int bytesToSend;
-// Driver Handles - Global variables
-
-void initUART(void){
-    UART_Params uartParams;
-    // Init the driver
-    UART_init();
-    // Configure the driver
-    UART_Params_init(&uartParams);
-    uartParams.writeDataMode = UART_DATA_BINARY;
-    uartParams.readDataMode = UART_DATA_BINARY;
-    uartParams.readReturnMode = UART_RETURN_FULL;
-    uartParams.baudRate = 115200;
-
-    // Open the driver
-    uart = UART_open(CONFIG_UART_0, &uartParams);
-    if (uart == NULL) {
-        /* UART_open() failed */
-        while (1);
-    }
-}
-// =======TASK SCHEDULER============
-
-typedef struct task {
-    int state; // current state of teh task
-    unsigned long period; //rate at which the task should tick
-    unsigned long elapsedTime; //Time since last tick
-    int (*TickFunct) (int); // Function to call for task's tick
-
-} task; //  two tasks
-
-const unsigned long tasksPeriodGCD = 100000; // greatest common denominator of the two task's period
-const unsigned long periodCheckButtons = 200000; // call every 200 ms
-const unsigned long periodReadTemp = 500000;   // call every 500 ms
-task tasks[2];
-
-
-// Driver Handles - Global variables
-Timer_Handle timer0;
-volatile unsigned char TimerFlag = 0;
-void timerCallback(Timer_Handle myHandle, int_fast16_t status){
-
-        TimerFlag = 1;
-}
-void initTimer(void){
+void initTimer(void)
+{
+    Timer_Handle timer0;
     Timer_Params params;
-    // Init the driver
     Timer_init();
-
-    // Configure the driver
     Timer_Params_init(&params);
-    params.period = 100000;  // 100 ms
+    params.period = 500000;
     params.periodUnits = Timer_PERIOD_US;
     params.timerMode = Timer_CONTINUOUS_CALLBACK;
     params.timerCallback = timerCallback;
 
-    // Open the driver
-    timer0 = Timer_open(CONFIG_TIMER_0, &params);
-    if (timer0 == NULL) {
-        /* Failed to initialized timer */
-        while (1) {}
-    }
-    if (Timer_start(timer0) == Timer_STATUS_ERROR) {
-        /* Failed to start timer */
-        while (1) {}
-    }
+
+
+
+
+     timer0 = Timer_open(CONFIG_TIMER_0, &params);
+     if (timer0 == NULL) {
+     /* Failed to initialized timer */
+     while (1) {}
+     }
+     if (Timer_start(timer0) == Timer_STATUS_ERROR) {
+     /* Failed to start timer */
+     while (1) {}
+     }
 }
-
-
-
-
-// ======== STATES ==========
-
-
-// CHECK BUTTONS transitions: increase value button pressed , decrease value button pressed
-enum BUTTON_STATES { BUTTON_INIT, BUTTON_INCREASE, BUTTON_DECREASE, BUTTON_WAIT} BUTTON_STATE;
-
-// CHECK BUTTONS: STATE MACHINE
- TickFunct_CheckButtons( ){
-
-    switch(BUTTON_STATE){   // transitions
-        case BUTTON_INIT:  // initial transition
-            BUTTON_STATE = BUTTON_WAIT;
-            break;
-        case BUTTON_INCREASE:
-            break;
-        case BUTTON_DECREASE:
-            break;
-        case BUTTON_WAIT:
-             if (DecreaseFlag){ // change state when button 0 pressed
-                BUTTON_STATE = BUTTON_DECREASE;
-             }
-             if (IncreaseFlag){ // change state when button 1 pressed
-                BUTTON_STATE = BUTTON_INCREASE;
-             }
-            break;
-        default:
-            BUTTON_STATE = BUTTON_INIT;
-            break;
-
-    }
-
-    switch(BUTTON_STATE){  // state actions
-        case BUTTON_INIT:
-            break;
-        case BUTTON_INCREASE:       // increase set point by 1 degree
-                setPoint += 1;
-                BUTTON_STATE = BUTTON_WAIT;
-            break;
-        case BUTTON_DECREASE:       // decrease set point by 1 degree
-                setPoint -= 1;
-                BUTTON_STATE = BUTTON_WAIT;
-            break;
-        case BUTTON_WAIT:           // change state to pause and determine if button has been pressed
-            break;
-        default:
-            BUTTON_STATE = BUTTON_INIT;
-            break;
-
-    }
-
-}
-
-//
-
-// READ TEMP transitions: warm, cold
-enum TEMP_STATES {TEMP_INIT, TEMP_ON, TEMP_OFF, TEMP_NEUTRAL} TEMP_STATE;
-
-// READ TEMP: STATE MACHINE
- TickFunct_ReadTemp(){
-
-    switch(TEMP_STATE){  // transitions
-        case TEMP_INIT: // initial transition
-            TEMP_STATE = TEMP_NEUTRAL;
-            break;
-        case TEMP_ON:
-            break;
-        case TEMP_OFF:
-            break;
-        case TEMP_NEUTRAL:
-            if(temperature < setPoint){  // too cold,turn ON LED heater
-                TEMP_STATE = TEMP_ON;
-            }else if(temperature > setPoint){ // too hot,turn OFF LED heater
-                TEMP_STATE = TEMP_OFF;
-            }
-            break;
-        default:
-            TEMP_STATE = TEMP_INIT;
-            break;
-
-    }
-
-    switch(TEMP_STATE){  // STATE ACTIONS
-        case TEMP_INIT:
-            break;
-        case TEMP_ON:  // turn on heater LED
-            GPIO_write(CONFIG_GPIO_LED_0, CONFIG_GPIO_LED_ON);
-            heat = 1;
-            TEMP_STATE = TEMP_NEUTRAL;
-            break;
-        case TEMP_OFF:  // turn off heater LED
-            GPIO_write(CONFIG_GPIO_LED_0, CONFIG_GPIO_LED_OFF);
-            heat = 0;
-            TEMP_STATE = TEMP_NEUTRAL;
-            break;
-        case TEMP_NEUTRAL:
-            temperature = readTemp();
-            break;
-        default:
-            TEMP_STATE = TEMP_INIT;
-            break;
-
-       }
-
-}
-
-
 /*
  *  ======== gpioButtonFxn0 ========
  *  Callback function for the GPIO interrupt on CONFIG_GPIO_BUTTON_0.
@@ -338,58 +96,191 @@ enum TEMP_STATES {TEMP_INIT, TEMP_ON, TEMP_OFF, TEMP_NEUTRAL} TEMP_STATE;
  */
 void gpioButtonFxn0(uint_least8_t index)
 {
-    IncreaseFlag = 1;  // raise increase flag
+//    /* Toggle an LED */
+//    GPIO_toggle(CONFIG_GPIO_LED_0);
+    if(isButtonPressed){
+        isButtonPressed = false; // set boolean for reference in SM
+    }else{
+        isButtonPressed = true;
+
+    }
+   // printf("button pressed button 0 : %d\n", isButtonPressed );
+
 }
 
 /*
  *  ======== gpioButtonFxn1 ========
  *  Callback function for the GPIO interrupt on CONFIG_GPIO_BUTTON_1.
  *  This may not be used for all boards.
-
+ *
+ *  Note: GPIO interrupts are cleared prior to invoking callbacks.
  */
 void gpioButtonFxn1(uint_least8_t index)
+
 {
-    DecreaseFlag = 1; // raise decrease flag
+     if(isButtonPressed){
+         isButtonPressed = false; // set boolean for reference in SM
+     }else{
+         isButtonPressed = true;
+
+     }
+    // printf("button pressed button 1 : %d\n", isButtonPressed );
+
 }
+
+
+// transitions: button pushed on , button pushed off
+// STATEs for LIGHTing LEDs
+enum LIGHT_STATES { LIGHT_INIT, LIGHT_SOS, LIGHT_OK,  LIGHT_PAUSE } LIGHT_STATE;
+
+
+// LED 0: red- symbolizes quick flash / dot
+// LED 1: green- symbolizes long flash / dash
+
+void flash_S(){
+    // flashes red LED as 'S' in morse code ( 3 quick flashes-dots)
+
+
+        GPIO_write(CONFIG_GPIO_LED_0, CONFIG_GPIO_LED_ON); // turn on Light
+        usleep(dotTime);                                      // wait for short delay
+        GPIO_write(CONFIG_GPIO_LED_0, CONFIG_GPIO_LED_OFF); // shut light off
+
+        usleep(delayTime_char);                   // wait in between letters
+
+        GPIO_write(CONFIG_GPIO_LED_0, CONFIG_GPIO_LED_ON); // turn on Light
+        usleep(dotTime);                                      // wait for short delay
+        GPIO_write(CONFIG_GPIO_LED_0, CONFIG_GPIO_LED_OFF); // shut light off
+
+        usleep(delayTime_char);                   // wait in between letters
+
+        GPIO_write(CONFIG_GPIO_LED_0, CONFIG_GPIO_LED_ON); // turn on Light
+        usleep(dotTime);                                      // wait for short delay
+        GPIO_write(CONFIG_GPIO_LED_0, CONFIG_GPIO_LED_OFF); // shut light off
+
+
+
+
+}
+void flash_O(){
+    // flashes green LED as 'O' in morse code ( 3 long flashes-dashes)
+
+        GPIO_write(CONFIG_GPIO_LED_1, CONFIG_GPIO_LED_ON); // turn light on
+        usleep(dashTime);                   // wait for long delay
+        GPIO_write(CONFIG_GPIO_LED_1, CONFIG_GPIO_LED_OFF); // turn light off
+
+        usleep(delayTime_char);                   // wait in between letters
+
+        GPIO_write(CONFIG_GPIO_LED_1, CONFIG_GPIO_LED_ON); // turn light on
+        usleep(dashTime);                   // wait for long delay
+        GPIO_write(CONFIG_GPIO_LED_1, CONFIG_GPIO_LED_OFF); // turn light off
+
+        usleep(delayTime_char);                   // wait in between letters
+
+        GPIO_write(CONFIG_GPIO_LED_1, CONFIG_GPIO_LED_ON); // turn light on
+        usleep(dashTime);                   // wait for long delay
+        GPIO_write(CONFIG_GPIO_LED_1, CONFIG_GPIO_LED_OFF); // turn light off
+
+        usleep(delayTime_char);                   // wait in between letters
+
+}
+void flash_K(){
+    // flashes LEDs as 'K' in morse code ( dash(green LED), dot(red LED), dash(green LED))
+
+        GPIO_write(CONFIG_GPIO_LED_1, CONFIG_GPIO_LED_ON); // turn light on
+        usleep(dashTime);                   // wait for long delay
+        GPIO_write(CONFIG_GPIO_LED_1, CONFIG_GPIO_LED_OFF); // turn light off
+        usleep(delayTime_char);                   // wait in between letters
+
+        GPIO_write(CONFIG_GPIO_LED_0, CONFIG_GPIO_LED_ON); // turn on Light
+        usleep(dotTime);                                      // wait for short delay
+        GPIO_write(CONFIG_GPIO_LED_0, CONFIG_GPIO_LED_OFF); // shut light off
+        usleep(delayTime_char);                   // wait in between letters
+
+        GPIO_write(CONFIG_GPIO_LED_1, CONFIG_GPIO_LED_ON); // turn light on
+        usleep(dashTime);                   // wait for long delay
+        GPIO_write(CONFIG_GPIO_LED_1, CONFIG_GPIO_LED_OFF); // turn light off
+
+
+    //    printf("flashed k\n" );
+
+}
+
+//// STATE Machine for Tick of LIGHTING LED MESSAGE
+void TickFunc_Light(){
+    switch(LIGHT_STATE){ // transitions
+        case LIGHT_INIT:     // initial transition
+            LIGHT_STATE = LIGHT_SOS;
+            break;
+        case LIGHT_SOS:
+            break;
+        case LIGHT_OK:
+            break;
+        case LIGHT_PAUSE:
+            usleep(delayTime_word);                // wait in between letters
+            if(isButtonPressed){  // change state based on button press
+                LIGHT_STATE = LIGHT_OK;
+            }else{
+                LIGHT_STATE = LIGHT_SOS;
+            }
+            break;
+        default:
+            LIGHT_STATE = LIGHT_INIT;
+            break;
+
+    }
+
+
+
+    switch(LIGHT_STATE){  //STATE Actions
+        case LIGHT_INIT:
+            break;
+        case LIGHT_SOS:                     // send SOS message with LEDs
+            flash_S();
+            usleep(delayTime_char);         // wait in between letters
+            flash_O();
+            usleep(delayTime_char);         // wait in between letters
+            flash_S();
+             LIGHT_STATE = LIGHT_PAUSE;     // change state to pause and determine if button has been pressed
+            break;
+        case LIGHT_OK:                      // Send OK message with LEDs
+            flash_O();
+            usleep(delayTime_char);         // wait in between letters
+            flash_K();
+             LIGHT_STATE = LIGHT_PAUSE;     // change state to pause and determine if button has been pressed
+            break;
+        case LIGHT_PAUSE:
+
+            break;
+        default:
+           LIGHT_STATE = LIGHT_INIT;
+        }
+
+}
+
 /*
  *  ======== mainThread ========
  */
-
-
 void *mainThread(void *arg0)
 {
 
+
+    isButtonPressed = false; // init button to unpressed and message to SOS
     /* Call driver init functions */
     GPIO_init();
-    initUART();
-    initI2C();
     initTimer();
-    unsigned int timer = 0; // used to count every 100 ms to print every second
-
-
-    // =====TASK :  check buttons ==========
-
-    const unsigned long Buttons_task_period = 200000;   // call every 200 ms
-    unsigned long Buttons_task_elapsedTime = 200000;
-
-
-    //======TASK :  read temperature/update LED========
-
-    const unsigned long TempLED_task_period = 500000;   // call every 500 ms
-    unsigned long TempLED_task_elapsedTime = 500000;
-
-
     /* Configure the LED and button pins */
     GPIO_setConfig(CONFIG_GPIO_LED_0, GPIO_CFG_OUT_STD | GPIO_CFG_OUT_LOW);
+    GPIO_setConfig(CONFIG_GPIO_LED_1, GPIO_CFG_OUT_STD | GPIO_CFG_OUT_LOW);
     GPIO_setConfig(CONFIG_GPIO_BUTTON_0, GPIO_CFG_IN_PU | GPIO_CFG_IN_INT_FALLING);
+
+//    /* Turn on user LED */
+//    GPIO_write(CONFIG_GPIO_LED_0, CONFIG_GPIO_LED_ON);
 
     /* Install Button callback */
     GPIO_setCallback(CONFIG_GPIO_BUTTON_0, gpioButtonFxn0);
-    GPIO_setCallback(CONFIG_GPIO_BUTTON_1, gpioButtonFxn1);
 
     /* Enable interrupts */
     GPIO_enableInt(CONFIG_GPIO_BUTTON_0);
-    GPIO_enableInt(CONFIG_GPIO_BUTTON_1);
 
     /*
      *  If more than one input pin is available for your device, interrupts
@@ -403,38 +294,12 @@ void *mainThread(void *arg0)
         GPIO_setCallback(CONFIG_GPIO_BUTTON_1, gpioButtonFxn1);
         GPIO_enableInt(CONFIG_GPIO_BUTTON_1);
     }
-    // initialize state machines
-    BUTTON_STATE = BUTTON_INIT;
-    TEMP_STATE = TEMP_INIT;
-    // loop forever
-
+    LIGHT_STATE = LIGHT_INIT; // Indicates initial call
     while(1){
-
-        while(!TimerFlag){} // wait for timer period
-       //  every 500 ms (500000 us)read the temperature and update the LED
-        if(TempLED_task_elapsedTime >= TempLED_task_period){
-                  TickFunct_ReadTemp(); // execute one tick
-                  TempLED_task_elapsedTime = 0;
-               }
-              TempLED_task_elapsedTime += 1000000; // set to timer period param
-              Buttons_task_elapsedTime += 1000000; // set to timer period param
-
-        // every 200 ms (200000 us)check the button flags
-        if(Buttons_task_elapsedTime >= Buttons_task_period){
-            TickFunct_CheckButtons();  //execute one tick
-            Buttons_task_elapsedTime = 0;
-            DecreaseFlag = 0; // lower flag raised by button 0
-            IncreaseFlag = 0; // lower flag raised by button 1
-        }
-        TimerFlag = 0; // lower flag raised by timer
-        ++timer;
-        // iterate 10 times (so 1 second has gone by)
-        if((timer % 10) == 0){
-            unsigned int seconds = timer / 10;
-            // every second output to UART:
-            DISPLAY( snprintf(output, BUFLEN, "<%02d, %02d, %d, %04d> \n\r", temperature, setPoint, heat, seconds))
-        }
-
+        TickFunc_Light(); // STATE MACHINE FOR MESSAGE OUTPUT WITH LEDS
+        while(!TimerFlag){} // wait for period
+        TimerFlag = 0;
     }
-   // return (NULL);
+//return(NULL);
+
 }
